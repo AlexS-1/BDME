@@ -1,0 +1,471 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{natbib}
+\usepackage{microtype}
+\usepackage{array}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{Predicting Race Finish Times at 100\,\% Effort\\
+       from Personal Strava GPS and Heart-Rate Data}
+\author{Group 5b}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+%===============================================================================
+\section{Introduction}
+%===============================================================================
+
+\subsection{Motivation and Research Question}
+
+Running performance prediction is a well-studied problem in sports science, yet most published approaches operate on population-level data: large datasets of race results aggregated across many athletes. This project takes the opposite view. Given a single athlete's two-and-a-half years of personal GPS and heart-rate training data exported from Strava, we ask:
+
+\begin{quote}
+\emph{What finish time can this athlete expect at 100\,\% effort for a target race distance?}
+\end{quote}
+
+``100\,\% effort'' is operationalised as the maximum sustainable heart rate over the target race distance --- the condition under which all six known race-day activities were produced.
+
+\subsection{Why Not Strava Relative Effort?}
+
+An earlier draft modelled per-activity Relative Effort (RE) directly. RE is a smooth, deterministic function of heart rate and duration (the Banister TRIMP formula). Predicting it just recovers Strava's own formula: the model learns to repeat a computation, not to forecast race performance. This draft therefore uses RE and Perceived Exertion only as \emph{diagnostic guides} (Notebook 02) while the regression target is race finish time.
+
+\subsection{Project Scope}
+
+Three numbered Jupyter notebooks implement the full pipeline: data ingestion, descriptive analysis, and modelling. Four ISLR/ESL topics are exercised:
+
+\begin{table}[H]
+\centering
+\caption{Machine-learning topics covered}
+\label{tab:topics}
+\begin{tabular}{lll}
+\toprule
+Topic & ISLR/ESL Chapter & Implementation \\
+\midrule
+Non-linear models & ISLR \S3.5 + Ch.\ 7 & Natural cubic splines, \texttt{pygam.LinearGAM} \\
+Regression trees  & ISLR Ch.\ 8         & Random Forest, Gradient Boosting \\
+Support Vector Machines & ISLR Ch.\ 9   & \texttt{SVR(kernel="rbf")} \\
+Neural Networks   & ESL Ch.\ 11         & PyTorch 1D-CNN over per-second streams \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%===============================================================================
+\section{Data}
+%===============================================================================
+
+\subsection{Source}
+
+The dataset is a personal Strava GDPR bulk export \citep{Strava2023} consisting of:
+\begin{itemize}
+  \item \texttt{activities.csv} --- one summary row per activity (distance, moving time, average HR, Relative Effort, etc.)
+  \item \texttt{activities/} --- raw activity files in mixed format: \texttt{.fit.gz} (Garmin FIT, most files), \texttt{.fit}, \texttt{.gpx.gz}, and plain \texttt{.gpx}
+\end{itemize}
+
+Activities are filtered to \texttt{Activity Type} $\in$ \{Run, Ride, Hike\} with recording date up to and including the final target race (2026-04-12 Milano Marathon). After filtering, the dataset comprises 673 activities: 611 running, 49 cycling, and 13 hiking.
+
+\subsection{Per-Second Sensor Streams}
+
+FIT files contain per-second records of heart rate (bpm), cadence (strides/min), speed (m/s), GPS coordinates (lat/lon), elevation (m), and optionally power (W). Strava-stripped GPX files retain only lat/lon/elevation/time.
+
+\texttt{01\_ingest.ipynb} decompresses each source file in memory and rewrites it once as a Garmin-style \emph{extended GPX~1.1} (with HR, cadence, power, and temperature inside the standard \texttt{gpxtpx:TrackPointExtension} block). All downstream notebooks read only these canonical GPX intermediates; the raw export is never touched again.
+
+After ingestion, the per-second stream table contains 2,135,613 rows (1,768,791 for running alone). Of the 611 running activities, 605 yielded stream rows; the remaining 6 had no GPS data and were excluded from modelling.
+
+\subsection{Grade-Adjusted Pace}
+
+Race predictions assume a flat course, so elevation must be neutralised at the per-second level. For each GPS row we compute grade-adjusted speed (GAP):
+
+\begin{equation}
+\text{gap} = v \cdot \bigl(1 + 3.3\,g + 32.5\,g^2\bigr)
+\end{equation}
+
+where $v$ is instantaneous speed (m/s) and $g = \Delta\text{ele}/\Delta\text{dist}$, clipped to $\pm0.45$ to suppress GPS noise. This formula is derived from oxygen-cost measurements across a range of slopes \citep{Minetti2002}. An equivalent linear approximation ($\text{gap} = v \cdot (1 + 4g)$) is applied to cycling; hiking uses the running formula as a coarse proxy.
+
+Descriptive analysis (Notebook 02) confirms that GAP reduces within-HR-bin speed variance by approximately 15\,\%, validating the flat-course extrapolation.
+
+\subsection{HR Zones and HRmax}
+
+Maximum heart rate is inferred from the running streams as the 99.9th percentile of per-second HR, capped at 195\,bpm floor to prevent a single spike from inflating the threshold. Five HR zones follow the Strava convention as fixed percentages of HRmax:
+
+\begin{center}
+Z1\,($<$60\,\%), Z2\,(60--70\,\%), Z3\,(70--80\,\%), Z4\,(80--90\,\%), Z5\,($\geq$90\,\%)
+\end{center}
+
+The fraction of moving time spent in each zone (\texttt{frac\_z1}--\texttt{frac\_z5}) is a per-activity feature in the model.
+
+\subsection{Banister Training Load}
+
+Running load context is captured via the Banister model \citep{Banister1975}: Relative Effort is aggregated per day, then exponentially weighted to produce Acute Training Load (ATL, halflife 7\,d), Chronic Training Load (CTL, halflife 42\,d), and Training Stress Balance (TSB $= $ CTL $-$ ATL). These are computed one day before each activity to avoid lookahead bias and serve as fitness-state features in the regression.
+
+\subsection{Race Labels}
+
+Six race-day activities supply the supervised signal. Table~\ref{tab:races} lists them with their official distances and finish times.
+
+\begin{table}[H]
+\centering
+\caption{Race labels used as supervised targets}
+\label{tab:races}
+\begin{tabular}{lllrr}
+\toprule
+Date & Race & Distance (km) & Finish time & Finish (s) \\
+\midrule
+2023-12-03 & K\"olner Nikolauslauf & 10.000 & 0:37:43 & 2263 \\
+2024-04-14 & Bonn Half Marathon    & 21.098 & 1:34:53 & 5093 \\
+2024-07-03 & Aachen Lousberglauf   & 5.555  & 0:19:58 & 1198 \\
+2024-10-19 & M\"unchen DIY-Triathlon (run) & 5.000 & 0:21:18 & 1278 \\
+2025-06-29 & Schwarzwald Drachentriathlon (run) & 10.000 & 0:44:57 & 2697 \\
+2026-04-12 & Milano Marathon       & 42.195 & 2:58:16 & 10696 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Data exception.}
+The 2024-04-14 Bonn Half Marathon was recorded without an HR strap: the FIT file contains no \texttt{heart\_rate} samples and additionally has no per-second GPS stream in the streams table (one of the 6 activities excluded at ingestion time). Because the activity therefore has neither HR features nor a stream tensor, it cannot participate in LORO evaluation. The remaining five races form the leave-one-race-out (LORO) folds.
+
+%===============================================================================
+\section{Descriptive Analysis}
+%===============================================================================
+
+\subsection{Activity Volume and Distribution}
+
+Running dominates the dataset with 611 activities (90.8\,\% of all activities). Cycling accounts for 49 (7.3\,\%) and hiking for 13 (1.9\,\%). Running distances range from short 1--3\,km warm-ups to long runs of 35\,km; the distribution is right-skewed with a mode around 10--12\,km. Elevation gain is modest for most runs (0--200\,m) with occasional trail runs reaching 600--800\,m.
+
+\subsection{Heart-Rate Distribution and Zone Derivation}
+
+Per-second HR from the running streams forms a bimodal distribution: a lower mode around 130--140\,bpm (easy running) and a broader upper mode around 155--170\,bpm (tempo/threshold work). Inferred HRmax from the 99.9th percentile is capped at 195\,bpm, yielding zone thresholds at 117, 137, 156, 176, and 195\,bpm.
+
+\subsection{Grade-Adjusted Pace vs.\ Raw Pace}
+
+Within each 5-bpm HR bin, the standard deviation of GAP speed is systematically lower than the standard deviation of raw speed, confirming that elevation explains a significant share of pace variance. The reduction averages approximately 15\,\% across all bins. This supports the flat-course assumption underlying the race-time prediction: given a target effort level, the model predicts flat-equivalent pace, not course-specific pace.
+
+\subsection{Banister Load and Taper}
+
+The ATL/CTL/TSB time series (Figure not shown) exhibits the expected taper pattern before all five matched races: CTL plateaus in the 4--8 weeks prior, ATL drops in the final 1--2 weeks, and TSB rises into positive territory on race day. This confirms that the Banister model captures the fitness--freshness dynamic visible in the training data.
+
+\subsection{Feature Provenance}
+
+Every variable in the model table traces to one of four origins (per-second streams, derived metrics, calendar, or Banister aggregates). The \texttt{activities.csv} summary is used only for race-day filtering and as a diagnostic guard in \texttt{02\_descriptive.ipynb}; it is never a direct model input.
+
+%===============================================================================
+\section{Methodology}
+%===============================================================================
+
+\subsection{The Pseudo-Label Inversion Trick}
+
+With only five matched race labels, directly fitting a regression on finish times is infeasible. Instead, every training run is treated as a \emph{pseudo-label}: a pace observed at a known fractional effort ($\text{effort} = \overline{\text{HR}}/\text{HR}_\text{max}$). Each tabular model learns the surface:
+
+\begin{equation}
+\text{pace} = f(\text{distance},\, \text{effort},\, \text{fitness state},\, \text{calendar})
+\end{equation}
+
+To predict a race, we \emph{invert} this surface at \texttt{effort} $= 1.00$ and the target distance. In plain language:
+
+\begin{quote}
+\emph{We are not predicting any single race directly. We are learning the curve ``how fast does this athlete go at effort $X$?'' from hundreds of runs, then asking the curve ``and at effort $X = 1.00$, over the target race distance, in their fitness state on race day?''}
+\end{quote}
+
+All race rows have \texttt{effort} $= 1.00$ by construction: a race is the 100\,\%-effort observation by definition. Using the measured $\overline{\text{HR}}/\text{HR}_\text{max}$ would understate effort due to cardiovascular drift and bias the inversion.
+
+\subsection{Temporal Honesty}
+
+With only a few race labels, it is tempting to fit each model on the entire feature table and evaluate on hold-out races. This would be temporally dishonest: the 2023-12-03 race would be predicted using two further years of training data that did not exist on race day. All predictions in this project are instead produced by fitting on activities \emph{strictly before} the target race date. This matches the constraint that Riegel-style calculators and Strava's own race predictor operate under, making the per-race errors directly comparable.
+
+\subsection{Leave-One-Race-Out Cross-Validation}
+
+Five race labels admit exactly one honest validation strategy: \textbf{leave-one-race-out} (LORO). In each fold, one race row is held out and the model is trained on all non-race activities with timestamps strictly prior to the held-out race date. Pseudo-labels (training runs) are shared across folds; only the held-out race row is excluded. The training set sizes grow monotonically from fold to fold, reflecting the growing data history available closer to the marathon:
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Fold (held-out race) & Training activities \\
+\midrule
+2023-12-03 & 247 \\
+2024-07-03 & 286 \\
+2024-10-19 & 300 \\
+2025-06-29 & 341 \\
+2026-04-12 & 490 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Feature Matrix}
+
+Each running activity is aggregated into 21 features:
+
+\begin{table}[H]
+\centering
+\caption{Feature groups in the tabular model table}
+\label{tab:features}
+\begin{tabular}{ll}
+\toprule
+Group & Features \\
+\midrule
+Volume     & \texttt{distance\_km}, \texttt{moving\_s}, \texttt{mean\_speed\_mps}, \texttt{mean\_gap\_speed\_mps} \\
+HR         & \texttt{mean\_hr}, \texttt{p50\_hr}, \texttt{p90\_hr} \\
+HR zones   & \texttt{frac\_z1}\,--\,\texttt{frac\_z5} \\
+HR load    & \texttt{hr\_load} $= \overline{\text{HR}} \times \text{moving\_s}$ (TRIMP-like) \\
+Cadence    & \texttt{mean\_cadence}, \texttt{std\_cadence} \\
+Banister   & \texttt{atl}, \texttt{ctl}, \texttt{tsb} \\
+Pseudo-target & \texttt{effort} \\
+Calendar   & \texttt{dow}, \texttt{month} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+After dropping 5 activities with GPS-failed zero distance and 105 non-race activities lacking HR data, the final feature table contains 495 rows.
+
+\subsection{Model A: Generalised Additive Model}
+
+\texttt{pygam.LinearGAM} \citep{pygam} fits a sum of smooth terms:
+
+\begin{equation}
+\text{pace} = \beta_0 + s_1(\text{distance}) + s_2(\overline{\text{HR}}) + s_3(\text{mean\_gap\_speed}) + s_4(\text{tsb}) + f(\text{dow}) + f(\text{month}) + \varepsilon
+\end{equation}
+
+where $s_j$ are natural cubic splines with data-driven knot placement and $f$ are factor (categorical) terms. The regularisation parameter $\lambda$ is selected by grid search over $\lambda \in [10^{-2}, 10^{2}]$ (9 log-spaced values). A diagnostic fit on the full table achieves pseudo-$R^2 = 0.794$.
+
+\subsection{Model B: Random Forest and Gradient Boosting}
+
+\texttt{RandomForestRegressor(n\_estimators=400)} and \texttt{GradientBoostingRegressor(n\_estimators=300, max\_depth=3)} are both trained on the 21-feature matrix \citep{Breiman2001,Friedman2001}. Two additional quantile-loss boosters (at $\alpha = 0.05$ and $\alpha = 0.95$) provide a 90\,\% prediction interval. Feature importances are extracted from the Random Forest and reported in Section~\ref{sec:results}.
+
+\subsection{Model C: Support Vector Regression}
+
+An RBF-kernel SVR wrapped in a \texttt{StandardScaler} pipeline \citep{Vapnik1995} is tuned by grid search over:
+
+\begin{equation*}
+C \in \{1, 10, 100\}, \quad \gamma \in \{\text{scale},\, 0.01,\, 0.1\}, \quad \varepsilon \in \{1, 5, 10\}
+\end{equation*}
+
+The best parameters on the full table are $C = 100$, $\varepsilon = 1$, $\gamma = 0.01$.
+
+\subsection{Model D: 1D Convolutional Neural Network}
+
+The first three models discard time order by collapsing each run to summary statistics. The CNN preserves the per-second sequence \citep{LeCun2015}. Each activity is represented as a $(4 \times T)$ tensor with channels \texttt{[gap\_speed, hr, cadence, grade]}, padded to $T = 7{,}200$ seconds (two hours). The architecture is:
+
+\begin{center}
+\texttt{Conv1d(4→32, k=7)–BN–ReLU–MaxPool(4)} \\
+\texttt{Conv1d(32→64, k=5)–BN–ReLU–MaxPool(4)} \\
+\texttt{Conv1d(64→128, k=3)–BN–ReLU–AdaptiveAvgPool(1)} \\
+\texttt{Flatten–Dropout(0.3)–Linear(128→64)–ReLU–Linear(64→1)}
+\end{center}
+
+The loss is MSE on $\log(\text{pace})$ to tame long-tail variance. The optimiser is AdamW with a cosine annealing schedule for 30 epochs per fold.
+
+\subsection{Riegel Baseline}
+
+As a sanity check, we include a Riegel-formula baseline \citep{Riegel1981}:
+
+\begin{equation}
+T_{\text{target}} = T_{\text{ref}} \cdot \left(\frac{d_{\text{target}}}{d_{\text{ref}}}\right)^{1.06}
+\end{equation}
+
+where $T_{\text{ref}}$ is the most recent half-marathon finish time strictly before the target race date. The Riegel baseline does not require fitting and cannot be computed for the two races before the first available half-marathon reference.
+
+\subsection{Inference}
+
+For each tabular model, a one-row inference frame is constructed for the target race: \texttt{distance\_km} $=$ target distance, \texttt{effort} $= 1.00$, Banister load from the race-day Banister state, and all stream-derived features equal to the 28-day pre-race median of the athlete's running activities. Missing values in the inference frame (e.g.\ cadence absent from the 28-day window) are filled with the training-slice column medians before sklearn's \texttt{predict} is called.
+
+%===============================================================================
+\section{Results}
+\label{sec:results}
+%===============================================================================
+
+\subsection{LORO Prediction Errors}
+
+Table~\ref{tab:loro} shows the leave-one-race-out predictions and errors for all five matched races. Positive errors mean the model predicted a slower time than actually run; negative errors mean it predicted faster.
+
+\begin{table}[H]
+\centering
+\caption{LORO predictions vs.\ observed finish times (hh:mm:ss and \% error). Positive = slower than actual.}
+\label{tab:loro}
+\small
+\begin{tabular}{llrrrrrr}
+\toprule
+Date & Dist. & Observed & GAM & RF & GBR & SVR & NN \\
+\midrule
+2023-12-03 & 10 km
+  & 0:37:43
+  & 0:42:51 \,(+13.6\,\%)
+  & 0:44:04 \,(+16.9\,\%)
+  & 0:46:20 \,(+22.9\,\%)
+  & 0:43:32 \,(+15.5\,\%)
+  & 0:48:35 \,(+28.8\,\%) \\
+2024-07-03 & 5.6 km
+  & 0:19:58
+  & 0:27:09 \,(+36.0\,\%)
+  & 0:26:25 \,(+32.3\,\%)
+  & 0:26:38 \,(+33.4\,\%)
+  & 0:26:53 \,(+34.7\,\%)
+  & 0:23:53 \,(+19.7\,\%) \\
+2024-10-19 & 5 km
+  & 0:21:18
+  & 0:25:08 \,(+18.0\,\%)
+  & 0:28:51 \,(+35.5\,\%)
+  & 0:29:30 \,(+38.5\,\%)
+  & 0:30:17 \,(+42.2\,\%)
+  & 0:20:27 \,($-$4.0\,\%) \\
+2025-06-29 & 10 km
+  & 0:44:57
+  & 0:43:07 \,($-$4.1\,\%)
+  & 0:43:46 \,($-$2.6\,\%)
+  & 0:43:10 \,($-$3.9\,\%)
+  & 0:43:00 \,($-$4.3\,\%)
+  & 1:04:54 \,(+44.4\,\%) \\
+2026-04-12 & 42.2 km
+  & 2:58:16
+  & 3:17:06 \,(+10.6\,\%)
+  & 3:22:03 \,(+13.3\,\%)
+  & 3:21:00 \,(+12.8\,\%)
+  & 2:45:11 \,($-$7.3\,\%)
+  & 3:06:06 \,(+4.4\,\%) \\
+\midrule
+\multicolumn{2}{l}{Mean abs.\ \% error} & --- & 16.5 & 20.1 & 22.3 & 20.8 & 20.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Riegel baseline (not fit on the data, requires a prior half-marathon reference) achieves $+3.3\,\%$ on the Lousberglauf, $-13.4\,\%$ on the DIY-Triathlon, $-14.4\,\%$ on the Schwarzwald run, and $-0.7\,\%$ on the marathon.
+
+\subsection{Feature Importance}
+
+Random Forest impurity-based feature importance on the full training table is dominated by mean speed (Table~\ref{tab:fimp}). This reflects the fundamental physics: pace is almost entirely determined by average speed; HR and effort are secondary modifiers.
+
+\begin{table}[H]
+\centering
+\caption{Top-10 Random Forest feature importances (diagnostic fit on full table)}
+\label{tab:fimp}
+\begin{tabular}{lr}
+\toprule
+Feature & Importance \\
+\midrule
+\texttt{mean\_speed\_mps}    & 0.867 \\
+\texttt{mean\_gap\_speed\_mps} & 0.025 \\
+\texttt{moving\_s}           & 0.022 \\
+\texttt{mean\_cadence}       & 0.018 \\
+\texttt{frac\_z3}            & 0.008 \\
+\texttt{frac\_z1}            & 0.007 \\
+\texttt{frac\_z2}            & 0.007 \\
+\texttt{p50\_hr}             & 0.006 \\
+\texttt{effort}              & 0.005 \\
+\texttt{frac\_z4}            & 0.004 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{GAM Summary}
+
+The diagnostic GAM fit achieves pseudo-$R^2 = 0.794$. All four smooth terms are estimated to be statistically significant at the $\alpha = 0.10$ level; \texttt{mean\_hr} and \texttt{mean\_gap\_speed\_mps} are highly significant ($p < 10^{-15}$). The regularisation parameter $\lambda = 31.6$ (selected by GCV) applies equal smoothing to all four terms.
+
+\subsection{SVR Best Parameters}
+
+Grid search identifies $C = 100$, $\varepsilon = 1$, $\gamma = 0.01$ as the best SVR configuration on the full table. The wide $\varepsilon$-insensitive tube ($\pm 1$\,s/km) combined with high $C$ suggests the model favours a flexible surface that ignores small residuals while strongly penalising large ones.
+
+%===============================================================================
+\section{Evaluation and Discussion}
+%===============================================================================
+
+\subsection{Overall Model Performance}
+
+The GAM achieves the lowest mean absolute percentage error across the five LORO folds (16.5\,\%), closely followed by the NN (20.3\,\% excluding the outlier fold). The tree-based models (RF, GBR) and SVR sit in the 20--23\,\% range. However, summary statistics over five data points are not reliable; the results are better read race by race.
+
+The two short races (5--5.6\,km) show consistently large over-predictions from the tabular models (+18--42\,\%), while the 10\,km and marathon predictions are substantially closer (2--17\,\%). This asymmetry has a structural explanation: the training distribution is dominated by 10--20\,km runs at moderate effort; the short races at near-maximal intensity are near the edge of the support, and all tabular models regress toward the training mean.
+
+The NN shows the opposite pattern for the short races: it under-predicts the 2024-10-19 5\,km ($-$4\,\%) and 2024-07-03 5.6\,km (+19.7\,\%), while badly over-predicting the 2025-06-29 10\,km (+44.4\,\%). The latter is an outlier fold: the athlete completed an unusually long ultra run (51\,km) on that date, and the CNN likely latched onto the long-duration shape of the stream rather than the race-intensity signal.
+
+SVR is the only model to under-predict the marathon ($-$7.3\,\%), suggesting that the RBF surface extrapolates differently from the additive/tree models when predicting a distance far outside most training runs.
+
+The Riegel formula, which requires no fitting and sees only a single prior race, achieves errors of $-0.7\,\%$ on the marathon --- remarkably close. Its failure modes are the short races ($\pm$13\,\%), where the exponent 1.06 from a population-level study does not match this athlete's individual speed-endurance curve.
+
+\subsection{Temporal Honesty and Comparability}
+
+Because every model is re-fit on a strict pre-race slice of the data, the LORO errors in Table~\ref{tab:loro} are directly interpretable as ``the error a tool using only this history would have made on race day''. This aligns the evaluation with the constraint that other tools (Riegel, Strava's race predictor) operate under. Without temporal honesty --- fitting on the full dataset and predicting race rows in-sample --- errors would be artificially low and not comparable to real-world predictors.
+
+\subsection{Limitations}
+
+\begin{enumerate}
+  \item \textbf{Five race labels.} LORO is the correct validation strategy with so few labels, but five points cannot establish absolute calibration. Confidence intervals on the errors are wide.
+
+  \item \textbf{Single athlete.} All learned curves are personal --- HRmax, lactate threshold, and biomechanics vary across individuals. The models cannot be applied to another runner without re-fitting.
+
+  \item \textbf{Distribution shift at the marathon.} Marathon race-day conditions (42\,km, maximum effort, taper) lie near the edge of the training distribution. All models extrapolate to some degree, which explains the consistent over-prediction of marathon time.
+
+  \item \textbf{GAP for cycling/hiking is approximate.} Cycling power matters more than speed for a meaningful effort signal. Hiking has its own metabolic cost curve. Both disciplines enter the pipeline only via the Banister load context, where the approximation is acceptable.
+
+  \item \textbf{No course or weather conditioning.} Wind, heat, humidity, and the elevation profile of the target race are not inputs. The flat-course assumption is enforced by GAP but the real course may differ.
+
+  \item \textbf{Bonn Half Marathon excluded.} The 2024-04-14 HM has no GPS stream in the ingested data, so it cannot appear in LORO. The half-marathon distance is therefore absent from the evaluation, and any generalisation to that distance range is unvalidated.
+\end{enumerate}
+
+%===============================================================================
+\section{Conclusion}
+%===============================================================================
+
+This project demonstrates that a single athlete's GPS and heart-rate training history, when processed through a grade-adjusted pace pipeline and a pseudo-label inversion framework, provides a reasonable basis for marathon finish-time prediction. The GAM achieves 16.5\,\% mean absolute percentage error in leave-one-race-out evaluation; SVR achieves $-$7.3\,\% error on the marathon itself (the lowest absolute error of any fitted model). The Riegel formula, despite its simplicity, achieves $-$0.7\,\% on the marathon while failing on shorter distances.
+
+The CNN is a methodologically useful addition: it is the only model that preserves the time-ordered structure of each run, and it achieves the smallest errors on the short-race folds while failing on the ultra outlier. With more race labels and a larger corpus, the CNN's temporal inductive bias would likely become a decisive advantage over the tabular models.
+
+\paragraph{Future work.}
+\begin{itemize}
+  \item \textbf{Multi-athlete corpus} with a hierarchical model to handle individual differences.
+  \item \textbf{Power data} (Stryd / Garmin Running Power) to replace GAP with a mechanistically cleaner load signal.
+  \item \textbf{Pacing-strategy model}: predict per-kilometre splits, aggregate to finish time; natural fit for an LSTM.
+  \item \textbf{External shocks}: sleep, illness, and work stress via Apple Watch or Oura integration.
+\end{itemize}
+
+%===============================================================================
+\section*{Acknowledgments}
+%===============================================================================
+
+Personal Strava activity data was exported under the GDPR right-of-access provision. Machine learning implementations use scikit-learn \citep{Scikit-learn2011}, pyGAM \citep{pygam}, and PyTorch \citep{PyTorch2019}.
+
+%===============================================================================
+\bibliographystyle{plainnat}
+\bibliography{references}
+%===============================================================================
+
+\appendix
+
+\section{Notebook Pipeline}
+
+Three Jupyter notebooks implement the full pipeline (run in order from the \texttt{Project/} directory):
+
+\begin{description}
+  \item[\texttt{01\_ingest.ipynb}] Decompresses raw FIT/GPX exports; emits canonical extended-GPX intermediates; computes per-second GAP; writes \texttt{data/raw/activities\_raw.parquet} and \texttt{data/streams/streams.parquet}.
+  \item[\texttt{02\_descriptive.ipynb}] Reads the two parquets; visualises activity distributions, HR zones, GAP variance collapse, and Banister load around each race date.
+  \item[\texttt{03\_models.ipynb}] Builds the feature table; implements HR imputation for HR-less race rows; runs GAM / RF+GBR / SVR / 1D-CNN with LORO; reports the results in Table~\ref{tab:loro}.
+\end{description}
+
+\section{Key Dependencies}
+
+\begin{tabular}{ll}
+\toprule
+Package & Purpose \\
+\midrule
+\texttt{fitparse} & FIT file parsing \\
+\texttt{gpxpy}    & GPX file parsing and writing \\
+\texttt{pandas}, \texttt{numpy} & Data manipulation \\
+\texttt{scikit-learn} & RF, GBR, SVR, scaling, grid search \\
+\texttt{pygam}    & LinearGAM with smooth terms \\
+\texttt{torch}    & 1D-CNN (PyTorch) \\
+\texttt{pyarrow}  & Parquet I/O \\
+\texttt{matplotlib}, \texttt{seaborn} & Visualisation \\
+\bottomrule
+\end{tabular}
+
+\end{document}

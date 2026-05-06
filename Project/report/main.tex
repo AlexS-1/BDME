@@ -57,13 +57,15 @@
 \title{\textbf{Predicting Running Race Finish Times\\
        from Personal GPS and Heart-Rate Training Data}\\[0.5em]
        {\large Big Data Methods for Economists --- Group 5b}}
-\author{Alexander Schranner}
+\author{Alexander Schranner \and Nicolas Stocker}
 \date{Spring Semester 2026 \\\vspace{0.8em}
       \includegraphics[height=1.4cm]{uzh_logo.png}}
 %% ─────────────────────────────────────────────────────────────────────────────
 
 \begin{document}
 \maketitle
+\thispagestyle{empty}
+\newpage
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \begin{abstract}
@@ -86,8 +88,9 @@ This accuracy is comparable to the Garmin Race Predictor's pre-race estimate
 ($\approx$3:06--3:10).
 \end{abstract}
 
-\bigskip
+\newpage
 \tableofcontents
+\newpage
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \section{Introduction}
@@ -173,7 +176,7 @@ predicted race-day fitness state.
 
 The ingestion pipeline decompresses each source file in memory and rewrites
 it once as a Garmin-style extended GPX 1.1 (heart rate and cadence inside the
-standard \texttt{gpxtpx:TrackPointExtension} block).
+standard \texttt{gpxtpx:}\allowbreak\texttt{TrackPointExtension} block).
 From these intermediates, \num{21} features per activity are computed and
 stored as a flat parquet file.
 
@@ -282,59 +285,6 @@ Minetti et al.\ metabolic-cost polynomial~\citep{Minetti2002}:
 \end{equation}
 where $v$ is raw speed (m/s) and $g = \Delta\text{ele}/\Delta\text{dist}$
 is the instantaneous grade, clipped to $\pm 0.45$ to suppress GPS noise.
-
-\Cref{fig:gap} demonstrates that across the full corpus, the within-activity
-standard deviation of GAP speed is materially lower than that of raw speed,
-confirming that \cref{eq:gap} successfully absorbs elevation-induced pace
-variability.
-
-\begin{figure}[htbp]
-  \centering
-  \includegraphics[width=0.90\textwidth]{fig_gap_variance.png}
-  \caption{Grade-Adjusted Pace (GAP) Reduces Within-Activity Speed Variance.
-           Each point represents one running activity.
-           Points below the diagonal (shown in grey) indicate variance
-           reduction; the bulk of activities benefit from GAP correction.}
-  \label{fig:gap}
-\end{figure}
-
-\subsection{Fitness Load Over Time}
-\label{ssec:banister}
-
-The Banister impulse--response model~\citep{Banister1975} decomposes training
-load into acute (short-term fatigue) and chronic (long-term fitness) components
-via exponential smoothing of Relative Effort with half-lives of 7 and
-42 days, respectively.
-The Training Stress Balance (TSB) encodes the classic ``fitness minus fatigue''
-concept:
-\begin{equation}
-  \mathrm{CTL}_t = \mathrm{RE}_t \cdot \alpha_{42} + (1-\alpha_{42})
-                   \cdot \mathrm{CTL}_{t-1}, \qquad
-  \mathrm{TSB}_t = \mathrm{CTL}_t - \mathrm{ATL}_t,
-  \label{eq:banister}
-\end{equation}
-where $\alpha_\tau = 1 - e^{-1/\tau}$ is the daily smoothing factor for
-half-life $\tau$.
-All three indices are computed on a rolling basis with a one-day lag
-to prevent data leakage.
-
-\Cref{fig:banister} shows the weekly load profile over the study period, with
-race dates overlaid as vertical markers.
-The characteristic taper pattern --- rising CTL, falling ATL, rising TSB in the
-weeks before each race --- is clearly visible, particularly in the lead-up to
-the 2026 Milano Marathon.
-
-\begin{figure}[htbp]
-  \centering
-  \includegraphics[width=0.95\textwidth]{fig_banister_load.png}
-  \caption{Banister Training Load Components Over the Study Period.
-           CTL (blue) tracks accumulated fitness; ATL (orange) tracks
-           short-term fatigue; TSB (green) is their difference.
-           Red vertical lines mark race dates.
-           The pre-marathon taper (early 2026) is visible as diverging
-           ATL and CTL with rising TSB.}
-  \label{fig:banister}
-\end{figure}
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \section{Methodology}
@@ -631,28 +581,6 @@ Lousberglauf and DIY-Triathlon folds are systematically difficult.
   \label{fig:comparison}
 \end{figure}
 
-\subsection{Feature Importance}
-\label{ssec:importance}
-
-\Cref{fig:importance} shows the RF and GBR mean-decrease-in-impurity
-importances.
-Mean speed dominates, accounting for over 87\% of RF importance and 82\% of
-GBR importance --- expected, since faster pace in training runs predicts
-faster race pace.
-Among the remaining features, moving time, mean cadence, and fractional
-effort carry modest but non-negligible weight, confirming that fitness-state
-variables and HR-zone fractions contribute beyond the raw pace proxy.
-
-\begin{figure}[htbp]
-  \centering
-  \includegraphics[width=0.88\textwidth]{fig_feature_importance.png}
-  \caption{Feature Importances for Random Forest and Gradient Boosted
-           Regression (Mean Decrease in Impurity, Normalised to Sum to 1).
-           Mean speed dominates; moving time, cadence, and effort fraction
-           are the next most informative features.}
-  \label{fig:importance}
-\end{figure}
-
 \subsection{Failure Analysis}
 \label{ssec:failures}
 
@@ -678,6 +606,23 @@ heart-rate channel, the CNN received a zero-filled HR tensor --- a pattern
 never seen during training --- causing a collapse to 0:49:12 ($-$42\%).
 The imputed HR features used by tabular models are drawn from the same
 pre-race distribution and produce a more modest 14--24\% over-prediction.
+
+\paragraph{CNN Suitability.}
+Taken together, these failures illustrate a structural limitation of the
+deep-learning approach in this setting.
+While the per-second tensors provide millions of training samples in raw terms,
+the supervised signal driving the network is still anchored to only a handful
+of race labels and a few hundred pseudo-labelled training runs.
+Convolutional architectures excel when label-rich tasks allow the network to
+learn invariances from the data; here, the opposite regime applies --- abundant
+input streams but extreme target-label scarcity.
+The CNN therefore tends to overfit idiosyncratic per-second patterns
+(zero-filled HR channels, triathlon fatigue signatures) that the tabular
+models smooth away through summary statistics.
+We conclude that, despite the high dimensionality of the underlying training
+data, a 1D CNN is not particularly well suited to this race-prediction problem
+without substantially more labelled race events or transfer learning from a
+multi-athlete corpus.
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \section{Race-Day Prediction and Benchmark Comparison}
@@ -707,7 +652,7 @@ approximately 2:58--2:59.
 
 \begin{figure}[htbp]
   \centering
-  \begin{subfigure}[b]{0.55\textwidth}
+  \begin{subfigure}[b]{\textwidth}
     \centering
     \includegraphics[width=\textwidth]{fig_race_predictor.png}
     \caption{Daily Race-Time Estimates for Four Distances (SVR, GBR, GAM,
@@ -720,8 +665,10 @@ approximately 2:58--2:59.
              ingested as the reference point.}
     \label{fig:predictor_svr}
   \end{subfigure}
-  \hfill
-  \begin{subfigure}[b]{0.41\textwidth}
+
+  \vspace{0.6em}
+
+  \begin{subfigure}[b]{\textwidth}
     \centering
     \includegraphics[width=\textwidth]{image2.png}
     \caption{Garmin Race Predictor (Marathon view) for the same period.

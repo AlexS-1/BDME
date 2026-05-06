@@ -25,3 +25,17 @@ Project/data/courses/*
 !Project/data/courses/*.gpx
 output/
 results/
+
+# LaTeX auxiliary files
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.nav
+*.out
+*.snm
+*.synctex.gz
+*.toc
+*.vrb

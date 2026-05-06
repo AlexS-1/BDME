@@ -47,7 +47,7 @@ An earlier draft modelled per-activity Relative Effort (RE) directly. RE is a sm
 
 \subsection{Project Scope}
 
-Three numbered Jupyter notebooks implement the full pipeline: data ingestion, descriptive analysis, and modelling. Four ISLR/ESL topics are exercised:
+Four numbered Jupyter notebooks implement the full pipeline: data ingestion, descriptive analysis, modelling, and evaluation. Four ISLR/ESL topics are exercised:
 
 \begin{table}[H]
 \centering
@@ -81,9 +81,9 @@ Activities are filtered to \texttt{Activity Type} $\in$ \{Run, Ride, Hike\} with
 
 \subsection{Per-Second Sensor Streams}
 
-FIT files contain per-second records of heart rate (bpm), cadence (strides/min), speed (m/s), GPS coordinates (lat/lon), elevation (m), and optionally power (W). Strava-stripped GPX files retain only lat/lon/elevation/time.
+FIT files contain per-second records of heart rate (bpm), cadence (strides/min), speed (m/s), GPS coordinates (lat/lon), and elevation (m). Strava-stripped GPX files retain only lat/lon/elevation/time.
 
-\texttt{01\_ingest.ipynb} decompresses each source file in memory and rewrites it once as a Garmin-style \emph{extended GPX~1.1} (with HR, cadence, power, and temperature inside the standard \texttt{gpxtpx:TrackPointExtension} block). All downstream notebooks read only these canonical GPX intermediates; the raw export is never touched again.
+\texttt{01\_ingest.ipynb} decompresses each source file in memory and rewrites it once as a Garmin-style \emph{extended GPX~1.1} (with HR and cadence inside the standard \texttt{gpxtpx:TrackPointExtension} block). All downstream notebooks read only these canonical GPX intermediates; the raw export is never touched again.
 
 After ingestion, the per-second stream table contains 2,135,613 rows (1,768,791 for running alone). Of the 611 running activities, 605 yielded stream rows; the remaining 6 had no GPS data and were excluded from modelling.
 
@@ -136,7 +136,7 @@ Date & Race & Distance (km) & Finish time & Finish (s) \\
 \end{table}
 
 \paragraph{Data exception.}
-The 2024-04-14 Bonn Half Marathon was recorded without an HR strap: the FIT file contains no \texttt{heart\_rate} samples and additionally has no per-second GPS stream in the streams table (one of the 6 activities excluded at ingestion time). Because the activity therefore has neither HR features nor a stream tensor, it cannot participate in LORO evaluation. The remaining five races form the leave-one-race-out (LORO) folds.
+The 2024-04-14 Bonn Half Marathon was recorded without an HR strap: the FIT file contains no \texttt{heart\_rate} samples, and the Strava-stripped GPX exposes no cumulative distance field. To keep this race label as the sixth LORO fold, two manual rescues are applied at ingestion and feature-build time: (i) per-activity distance falls back to $\int v\,dt$ from the speed channel when \texttt{dist\_m} is unusable, and (ii) HR features (\texttt{mean\_hr}, \texttt{p50\_hr}, \texttt{p90\_hr}, \texttt{frac\_z1--z5}, \texttt{hr\_load}) are imputed from the median of the 28~days of running activities preceding the race. The \texttt{effort} field for the row is set to 1.00 by construction (races are 100\,\%-effort observations). All six races thus form the leave-one-race-out (LORO) folds.
 
 %===============================================================================
 \section{Descriptive Analysis}
@@ -203,6 +203,25 @@ Fold (held-out race) & Training activities \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\subsection{Data Quality: Confidence Weights}
+\label{sec:conf_weights}
+
+GPS signal loss at the beginning (or during) a run is a real data quality issue: a missing GPS lock produces NaN speed and elevation for the affected seconds, making pace and GAP unreliable for those observations. Rather than applying a binary drop/keep threshold — which would reduce an already small training set — each activity is assigned a continuous confidence score $w_i \in [0, 1]$ that down-weights unreliable pseudo-labels in proportion to their quality:
+
+\begin{equation}
+w_i = c_{\text{GPS},i} \times c_{\text{ele},i} \times c_{\text{HR},i} \times c_{\text{dur},i}
+\end{equation}
+
+where:
+\begin{itemize}
+  \item $c_{\text{GPS}} = \text{fraction of seconds with valid GPS speed}$
+  \item $c_{\text{ele}} = \text{fraction of seconds with valid elevation (needed for GAP)}$
+  \item $c_{\text{HR}}  = \text{fraction of seconds with valid HR (drives the effort estimate)}$
+  \item $c_{\text{dur}} = \min(1,\, t_{\text{moving}} / 1800\,\text{s})$ — full weight at $\geq 30$ min; ramps linearly below
+\end{itemize}
+
+Race rows are assigned $w = 1.0$ unconditionally: they are ground-truth labels regardless of sensor quality. The weight $w_i$ is then passed as \texttt{sample\_weight} to every model's \texttt{fit()} call (GAM, RF, GBR, SVR) and as a per-sample multiplier on the squared error in the CNN's loss function. Activities are never discarded; they simply contribute proportionally less to the learned surface when their data quality is lower.
 
 \subsection{Feature Matrix}
 
@@ -382,15 +401,13 @@ Grid search identifies $C = 100$, $\varepsilon = 1$, $\gamma = 0.01$ as the best
 
 \subsection{Overall Model Performance}
 
-The GAM achieves the lowest mean absolute percentage error across the five LORO folds (16.5\,\%), closely followed by the NN (20.3\,\% excluding the outlier fold). The tree-based models (RF, GBR) and SVR sit in the 20--23\,\% range. However, summary statistics over five data points are not reliable; the results are better read race by race.
+SVR achieves the lowest mean absolute percentage error across the six LORO folds (17.97\,\%), with the tabular field tightly clustered: GAM~19.02\,\%, RF~18.96\,\%, GBR~19.17\,\%. Riegel produces predictions for only four of the six folds (the first two races have no prior race available), so its 7.96\,\% MAPE is computed on a smaller, easier subset. Summary statistics over six data points remain noisy; the results are better read race by race.
 
-The two short races (5--5.6\,km) show consistently large over-predictions from the tabular models (+18--42\,\%), while the 10\,km and marathon predictions are substantially closer (2--17\,\%). This asymmetry has a structural explanation: the training distribution is dominated by 10--20\,km runs at moderate effort; the short races at near-maximal intensity are near the edge of the support, and all tabular models regress toward the training mean.
+The two short races (5--5.6\,km) show consistently large over-predictions from the tabular models ($+$20--43\,\%), while the 10\,km, half marathon, and marathon predictions are substantially closer (mostly within $\pm$5\,\% on the half and the marathon). This asymmetry has a structural explanation: the training distribution is dominated by 10--20\,km runs at moderate effort; the short races at near-maximal intensity are near the edge of the support, and all tabular models regress toward the training mean.
 
-The NN shows the opposite pattern for the short races: it under-predicts the 2024-10-19 5\,km ($-$4\,\%) and 2024-07-03 5.6\,km (+19.7\,\%), while badly over-predicting the 2025-06-29 10\,km (+44.4\,\%). The latter is an outlier fold: the athlete completed an unusually long ultra run (51\,km) on that date, and the CNN likely latched onto the long-duration shape of the stream rather than the race-intensity signal.
+SVR is the closest to the observed marathon time (only $+$0.31\,\% over-prediction on 2026-04-12). The half marathon (2024-04-14, with imputed HR features) is also predicted within $\pm$15\,\% across all four tabular models, validating the imputation strategy.
 
-SVR is the only model to under-predict the marathon ($-$7.3\,\%), suggesting that the RBF surface extrapolates differently from the additive/tree models when predicting a distance far outside most training runs.
-
-The Riegel formula, which requires no fitting and sees only a single prior race, achieves errors of $-0.7\,\%$ on the marathon --- remarkably close. Its failure modes are the short races ($\pm$13\,\%), where the exponent 1.06 from a population-level study does not match this athlete's individual speed-endurance curve.
+The Riegel formula, which requires no fitting and sees only a single prior race, achieves $-0.72\,\%$ on the marathon and $+3.32\,\%$ on the 5.555\,km Lousberglauf, but underperforms on the 10\,km and 5\,km folds where the population-level exponent~1.06 does not match this athlete's individual speed-endurance curve.
 
 \subsection{Temporal Honesty and Comparability}
 
@@ -399,7 +416,7 @@ Because every model is re-fit on a strict pre-race slice of the data, the LORO e
 \subsection{Limitations}
 
 \begin{enumerate}
-  \item \textbf{Five race labels.} LORO is the correct validation strategy with so few labels, but five points cannot establish absolute calibration. Confidence intervals on the errors are wide.
+  \item \textbf{Six race labels.} LORO is the correct validation strategy with so few labels, but six points cannot establish absolute calibration. Confidence intervals on the errors are wide.
 
   \item \textbf{Single athlete.} All learned curves are personal --- HRmax, lactate threshold, and biomechanics vary across individuals. The models cannot be applied to another runner without re-fitting.
 
@@ -409,14 +426,14 @@ Because every model is re-fit on a strict pre-race slice of the data, the LORO e
 
   \item \textbf{No course or weather conditioning.} Wind, heat, humidity, and the elevation profile of the target race are not inputs. The flat-course assumption is enforced by GAP but the real course may differ.
 
-  \item \textbf{Bonn Half Marathon excluded.} The 2024-04-14 HM has no GPS stream in the ingested data, so it cannot appear in LORO. The half-marathon distance is therefore absent from the evaluation, and any generalisation to that distance range is unvalidated.
+  \item \textbf{Bonn Half Marathon HR is imputed.} The 2024-04-14 HM was recorded without an HR strap; HR features are filled from the 28-day pre-race median (see Data Exception above). LORO error on this fold reflects both the model and the imputation; an HR-equipped HM would tighten the half-marathon-distance evaluation.
 \end{enumerate}
 
 %===============================================================================
 \section{Conclusion}
 %===============================================================================
 
-This project demonstrates that a single athlete's GPS and heart-rate training history, when processed through a grade-adjusted pace pipeline and a pseudo-label inversion framework, provides a reasonable basis for marathon finish-time prediction. The GAM achieves 16.5\,\% mean absolute percentage error in leave-one-race-out evaluation; SVR achieves $-$7.3\,\% error on the marathon itself (the lowest absolute error of any fitted model). The Riegel formula, despite its simplicity, achieves $-$0.7\,\% on the marathon while failing on shorter distances.
+This project demonstrates that a single athlete's GPS and heart-rate training history, when processed through a grade-adjusted pace pipeline and a pseudo-label inversion framework, provides a reasonable basis for marathon finish-time prediction. SVR achieves the lowest mean absolute percentage error across the six leave-one-race-out folds (17.97\,\%) and is the closest model on the marathon itself ($+$0.31\,\%). The Riegel formula, despite its simplicity, achieves $-0.72\,\%$ on the marathon while failing on shorter distances. A daily-cadence ``race-time predictor'' visualisation (Notebook~04, \S4.7) reproduces the user-facing curves shown by Garmin and Strava across configurable distances and models, demonstrating that the same temporal-honesty pipeline can drive a real-time predictor in addition to the LORO evaluation.
 
 The CNN is a methodologically useful addition: it is the only model that preserves the time-ordered structure of each run, and it achieves the smallest errors on the short-race folds while failing on the ultra outlier. With more race labels and a larger corpus, the CNN's temporal inductive bias would likely become a decisive advantage over the tabular models.
 
@@ -443,12 +460,13 @@ Personal Strava activity data was exported under the GDPR right-of-access provis
 
 \section{Notebook Pipeline}
 
-Three Jupyter notebooks implement the full pipeline (run in order from the \texttt{Project/} directory):
+Four Jupyter notebooks implement the full pipeline (run in order from the \texttt{Project/} directory):
 
 \begin{description}
   \item[\texttt{01\_ingest.ipynb}] Decompresses raw FIT/GPX exports; emits canonical extended-GPX intermediates; computes per-second GAP; writes \texttt{data/raw/activities\_raw.parquet} and \texttt{data/streams/streams.parquet}.
   \item[\texttt{02\_descriptive.ipynb}] Reads the two parquets; visualises activity distributions, HR zones, GAP variance collapse, and Banister load around each race date.
-  \item[\texttt{03\_models.ipynb}] Builds the feature table; implements HR imputation for HR-less race rows; runs GAM / RF+GBR / SVR / 1D-CNN with LORO; reports the results in Table~\ref{tab:loro}.
+  \item[\texttt{03\_models.ipynb}] Builds the feature table; implements HR imputation and the speed-integration distance fallback for HR-less race rows; runs GAM / RF+GBR / SVR / 1D-CNN with LORO; reports the results in Table~\ref{tab:loro}; persists \texttt{data/processed/loro\_results.parquet} and \texttt{data/processed/feature\_importance.parquet}.
+  \item[\texttt{04\_evaluation.ipynb}] Loads the LORO and feature-importance parquets; computes aggregate metrics (MAPE/MAE/MedAE/RMSE/Bias) and the model-comparison plots (\S4.2--4.3); reports the GBR 90\,\% prediction-interval coverage (\S4.4); plots Random-Forest / GBR feature importance (\S4.5); applies a Minetti-formula course-elevation correction to a chosen race (\S4.6, filename-stem matched against \texttt{data/courses/*.gpx}); and produces a daily-cadence Garmin/Strava-style race-time predictor across configurable distances, models and lookback windows (\S4.7).
 \end{description}
 
 \section{Key Dependencies}

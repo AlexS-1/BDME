@@ -19,6 +19,9 @@ node_modules/
 .ipynb_checkpoints/
 .Rhistory
 .RData
-data/
+Project/data/*
+!Project/data/courses/
+Project/data/courses/*
+!Project/data/courses/*.gpx
 output/
 results/

@@ -63,8 +63,6 @@
 
 \begin{document}
 \maketitle
-\tableofcontents
-\bigskip
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \begin{abstract}
@@ -86,6 +84,9 @@ This accuracy is comparable to the Garmin Race Predictor's pre-race estimate
 ($\approx$2:58--2:59) and substantially exceeds Strava's pre-race forecast
 ($\approx$3:06--3:10).
 \end{abstract}
+
+\bigskip
+\tableofcontents
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \section{Introduction}
@@ -124,27 +125,29 @@ race day.
 
 \begin{figure}[htbp]
   \centering
-  \begin{subfigure}[b]{0.48\textwidth}
+  \begin{subfigure}[b]{0.42\textwidth}
     \centering
     \includegraphics[width=\textwidth]{strava_summary_today_crop.png}
-    \caption{Strava Performance Predictions as of May 2026: 5K = 18:17,
-             10K = 38:05, HM = 1:24:36, Marathon = 3:06:42.}
+    \caption{Strava Performance Predictions (``Today'' view, 6 May 2026).
+             Predicted finish times compared to 30 days prior:
+             5K = 18:17 ($+$12 s), 10K = 38:05 ($+$38 s),
+             HM = 1:24:36 ($+$2m 28s), Marathon = 3:06:42 ($+$3m 52s).}
     \label{fig:strava_today}
   \end{subfigure}
   \hfill
-  \begin{subfigure}[b]{0.48\textwidth}
+  \begin{subfigure}[b]{0.55\textwidth}
     \centering
     \includegraphics[width=\textwidth]{image.png}
-    \caption{Garmin Race Predictor for the four weeks preceding the 2026
-             Milano Marathon. The pre-race estimate settled near
-             4:13--4:15 min/km, corresponding to a finish time of
-             approximately 2:58--2:59.}
+    \caption{Garmin Race Predictor (4-week view, Mar 16 -- Apr 12 2026),
+             showing predicted pace per km for all four distances.
+             The marathon estimate (red, bottom line) settled near
+             4:13--4:15 min/km before race day, corresponding to a finish
+             time of approximately 2:58--2:59.
+             The spike on 12 April reflects ingestion of the actual result.}
     \label{fig:garmin_4wk}
   \end{subfigure}
-  \caption{Commercial race-time predictions from Strava and Garmin Connect.
-           Both tools use the same athlete's activity history.
-           The spike on 12 April 2026 in \subref{fig:garmin_4wk} reflects
-           ingestion of the actual marathon result.}
+  \caption{Commercial Race-Time Predictions from Strava and Garmin Connect,
+           both using the same athlete's activity history.}
   \label{fig:predictions}
 \end{figure}
 
@@ -431,9 +434,29 @@ Training uses AdamW with cosine annealing, dropout (0.3), and
 weight decay ($10^{-4}$).
 
 \paragraph{F. Riegel Power-Law Baseline.}
-The empirical endurance formula $T_2 = T_1 \cdot (D_2/D_1)^{1.06}$
-\citep{Riegel1981} requires at least one prior comparable race and is
-therefore available for only four of the six folds.
+\citet{Riegel1981} observed that athletic performance scales with distance
+according to a power law.
+Given a known finish time $T_1$ over distance $D_1$, the predicted time
+$T_2$ over a different distance $D_2$ is:
+\begin{equation}
+  T_2 = T_1 \cdot \left(\frac{D_2}{D_1}\right)^{1.06},
+  \label{eq:riegel}
+\end{equation}
+where the exponent 1.06 was fit empirically from world-record progressions
+and has since been validated across recreational athletes.
+In the daily predictor (\cref{fig:predictor}), the Riegel estimate appears as
+a \emph{step function}: it stays constant between races because it
+recalculates only when a new race result becomes available as the reference
+point $(D_1, T_1)$.
+Each step corresponds to the next race being ingested.
+This means Riegel provides no day-to-day sensitivity to changes in training
+load or fitness --- it simply scales the most recent race time to the target
+distance and holds that value until the next race.
+Compared to the ML models, which update their pace--effort surface
+continuously from every training run, this is a fundamental limitation of
+the formula in a real-time prediction context.
+In the LORO evaluation, Riegel is available for only four of the six folds
+(the first two folds have no prior race to reference).
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \section{Results}
@@ -665,11 +688,17 @@ pre-race distribution and produce a more modest 14--24\% over-prediction.
 
 Beyond the LORO evaluation, the fitted models can be queried on any calendar
 day to produce a forward-looking race-time estimate.
-\Cref{fig:predictor} shows the daily SVR prediction for four standard distances
-(5 km, 10 km, half marathon, marathon) over the twelve months preceding the
-2026 Milano Marathon.
-The marathon curve reflects the gradual fitness build-up and subsequent taper,
-settling near 2:58--3:00 in the final two weeks.
+\Cref{fig:predictor} shows the daily predictions of SVR, GBR, GAM, and Riegel
+for four standard distances over the six months preceding the 2026 Milano
+Marathon, with all models refitted each day on the preceding six months of
+training data.
+The ML curves (SVR, GBR, GAM) reflect the gradual fitness build-up and
+subsequent taper, settling near 2:58--3:00 for the marathon in the final two
+weeks.
+The Riegel line, by contrast, is a step function: it remains flat between
+races and only updates when a new race result is ingested as a reference
+(\cref{eq:riegel}), so it carries no information about day-to-day training
+load dynamics.
 The Garmin Race Predictor for the same period (\cref{fig:garmin_marathon})
 shows a comparable trajectory, converging on 4:13--4:15 min/km in the weeks
 immediately before race day --- corresponding to a finish time of
@@ -680,9 +709,14 @@ approximately 2:58--2:59.
   \begin{subfigure}[b]{0.55\textwidth}
     \centering
     \includegraphics[width=\textwidth]{fig_race_predictor.png}
-    \caption{Daily SVR Race-Time Estimates for Four Distances.
-             The shaded band shows the 90\% GBR prediction interval.
-             Race events are marked with vertical lines.}
+    \caption{Daily Race-Time Estimates for Four Distances (SVR, GBR, GAM,
+             and Riegel), refitted each day on the preceding six months
+             of training data.
+             The shaded band is the 90\% GBR prediction interval.
+             Race events are marked with vertical lines.
+             Riegel (green) appears as a step function: it holds constant
+             between races and jumps only when a new race result is
+             ingested as the reference point.}
     \label{fig:predictor_svr}
   \end{subfigure}
   \hfill

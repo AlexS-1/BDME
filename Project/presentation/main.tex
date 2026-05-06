@@ -58,7 +58,7 @@
 \subsection{Research Question}
 \begin{frame}{Research Question}
 
-\textbf{Given an athlete's history of GPS-bearing training runs, what finish time can they expect to achieve with 100\%\ effort?}
+\textbf{Given only an athlete's open Strava export, how accurately can a transparent statistical or machine-learning model predict race finish times?}
 \end{frame}
 
 % ------------------------------------------------------------
@@ -109,6 +109,30 @@ Effort / calendar & \texttt{effort}, \texttt{dow}, \texttt{month} \\
 \end{frame}
 
 % ------------------------------------------------------------
+\begin{frame}{Data Quality and Sample Weighting}
+
+\textbf{Each training observation is assigned a confidence weight $w \in [0,1]$:}
+
+\[
+w = \underbrace{c_{\text{GPS}}}_{\text{valid speed}} \times
+    \underbrace{c_{\text{ele}}}_{\text{valid elevation}} \times
+    \underbrace{c_{\text{HR}}}_{\text{valid HR}} \times
+    \underbrace{c_{\text{dur}}}_{\geq 30\,\text{min}}
+\]
+
+\vspace{0.2cm}
+
+\begin{itemize}
+    \item Each $c_i$ = fraction of per-second records with a valid sensor reading (0 = none, 1 = complete).
+    \item $c_{\text{dur}}$ ramps linearly from 0 to 1 for moving time below 30 min (very short runs carry less signal).
+    \item \textbf{Race rows} are pinned to $w = 1.0$ — ground-truth labels regardless of sensor dropouts.
+    \item \textbf{Bonn HM (2024-04-14):} no HR strap $\Rightarrow$ HR features median-imputed from the 28-day pre-race window of other runs.
+    \item All tabular models (GAM, RF, GBR, SVR) consume $w$ via \texttt{sample\_weight}; mean weight per LORO fold: 0.60--0.71.
+\end{itemize}
+
+\end{frame}
+
+% ------------------------------------------------------------
 \begin{frame}{Descriptive Summary}
 \centering
 \begin{columns}[T,totalwidth=\textwidth]
@@ -121,6 +145,37 @@ Effort / calendar & \texttt{effort}, \texttt{dow}, \texttt{month} \\
 
 % ------------------------------------------------------------
 \section{Methodology}
+\subsection{Motivation: Limitations of Existing Predictors}
+
+\begin{frame}{Commercial Race Predictors and Their Limitations}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l l l}
+\toprule
+\textbf{Platform} & \textbf{Method} & \textbf{Key Limitation} \\
+\midrule
+Riegel (1981)  & Power law from one reference race        & Ignores all training history \\
+Strava         & Riegel-like; updates on new race         & Step function; no load sensitivity \\
+Garmin         & VO\textsubscript{2}max estimate + power law & Proprietary; black-box \\
+\bottomrule
+\end{tabular}}
+\end{center}
+
+\textbf{Shared limitations:}
+\begin{itemize}\setlength{\itemsep}{2pt}
+    \item \textbf{Race-only calibration} --- hundreds of training runs discarded.
+    \item \textbf{Flat-course assumption} --- same prediction regardless of course profile.
+    \item \textbf{No uncertainty quantification} --- point estimate only, no prediction interval.
+    \item \textbf{Opaque models} --- no interpretability beyond the formula itself.
+\end{itemize}
+
+\smallskip
+
+{\small\raggedright\textbf{$\Rightarrow$ Our approach:} use \emph{all} training runs via pseudo-label inversion, transparent models with prediction intervals, and Minetti elevation correction.\par}
+
+\end{frame}
+
 \subsection{Modelling Approach}
 \begin{frame}{Methodology}
 
@@ -292,6 +347,26 @@ $^\ddagger$ Run after swim\,+\,bike; fatigue state outside training distribution
 \end{frame}
 
 % ------------------------------------------------
+\begin{frame}{Results: Model Comparison}
+
+\includegraphics[width=\textwidth, height=0.50\textheight, keepaspectratio]{graphics/model_comparison.png}
+
+\scriptsize
+\begin{columns}[T]
+\begin{column}{0.48\textwidth}
+    \textbf{Left --- Predicted vs.\ Observed:}
+    SVR sits on the identity line for the marathon; all others overshoot.
+\end{column}
+\begin{column}{0.48\textwidth}
+    \textbf{Right --- Per-Race Error (s):}
+    Marathon: SVR $\approx 0$ s; others $+1\,000$--$1\,400$ s.
+    Short races: systematic over-prediction; triathlon: Riegel under-predicts.
+\end{column}
+\end{columns}
+
+\end{frame}
+
+% ------------------------------------------------
 \begin{frame}{Results: Marathon Predictor --- Daily Estimates (6-Month View)}
 
 \begin{columns}[T,totalwidth=\textwidth]
@@ -342,22 +417,48 @@ $^\ddagger$ Run after swim\,+\,bike; fatigue state outside training distribution
 
 \end{frame}
 
+
 % ------------------------------------------------
-\begin{frame}{Results: Model Comparison}
+\begin{frame}{Results: Course Elevation --- Lousberglauf (5.555 km)}
 
-\includegraphics[width=\textwidth, height=0.50\textheight, keepaspectratio]{graphics/model_comparison.png}
+\begin{columns}[T,totalwidth=\textwidth]
 
-\scriptsize
-\begin{columns}[T]
-\begin{column}{0.48\textwidth}
-    \textbf{Left --- Predicted vs.\ Observed:}
-    SVR sits on the identity line for the marathon; all others overshoot.
+\begin{column}{0.55\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{graphics/lousberglauf_profile.png}
+
+    \vspace{0.1cm}
+    \scriptsize
+    \textbf{Course:} 5.53 km, $\uparrow$56 m / $\downarrow$37 m.\\
+    \textbf{GAP factor} = 1.0241 (Minetti, segment-weighted) $\Rightarrow$ course is $\sim$2.4\% harder than flat.
 \end{column}
-\begin{column}{0.48\textwidth}
-    \textbf{Right --- Per-Race Error (s):}
-    Marathon: SVR $\approx 0$ s; others $+1\,000$--$1\,400$ s.
-    Short races: systematic over-prediction; triathlon: Riegel under-predicts.
+
+\begin{column}{0.43\textwidth}
+    \scriptsize
+    \begin{tabular}{l r r r}
+    \toprule
+    \textbf{Model} & \textbf{Flat} & \textbf{Adj.} & \textbf{$\Delta$} \\
+    \midrule
+    GAM    & 27:42 & 28:22 & +40 s \\
+    RF     & 26:17 & 26:54 & +38 s \\
+    GBR    & 26:33 & 27:12 & +38 s \\
+    SVR    & 26:23 & 27:01 & +38 s \\
+    NN     & 22:34 & 23:06 & +33 s \\
+    \midrule
+    \textbf{Actual} & \multicolumn{2}{r}{\textbf{19:58}} & --- \\
+    \bottomrule
+    \end{tabular}
+
+    \vspace{0.15cm}
+    \scriptsize
+    \begin{itemize}\setlength{\itemsep}{1pt}
+        \item Models learn pace on \textbf{GAP} $\Rightarrow$ flat-course predictions.
+        \item Multiplicative course correction recovers terrain effect at inference time.
+        \item \textbf{Riegel, Strava, Garmin}: one number per distance, no course input.
+        \item Lousberglauf gentle (+2.4\%); mountain races can exceed +15\%.
+    \end{itemize}
 \end{column}
+
 \end{columns}
 
 \end{frame}

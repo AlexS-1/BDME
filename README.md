@@ -37,7 +37,7 @@ Personal Strava bulk export. Located one directory above the repository root at 
 
 ### Filtering
 
-Keep `Activity Type ∈ {Run, Ride, Hike}` with `activity_dt ≤ 2026-04-12 23:59:59` (cuts off post-final-race activities). Run is the modelling target; Ride and Hike enter only via the Banister load context (ATL/CTL/TSB) so cross-training contributes to the race-day fitness state.
+Keep `Activity Type ∈ {Run, Ride, Hike}`. Run is the modelling target; Ride and Hike enter only via the Banister load context (ATL/CTL/TSB) so cross-training contributes to the race-day fitness state.
 
 ### Per-Second Sensor Streams
 
